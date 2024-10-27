@@ -171,4 +171,15 @@ cython_debug/
 #       |-pickles_dataset1
 #       |-pickles_dataset2
 #       |-...
+#   |-output
+#       |-pickles_dataset1
+#       |-pickles_dataset2
+#       |-...
+
 data/images
+data/output
+data/pickles
+data/images.nosync
+data/output.nosync
+data/pickles.nosync
+src/img_size_change.py
