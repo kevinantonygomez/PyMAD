@@ -1,24 +1,19 @@
 '''
 Main k-nnn + CNN model
 '''
-from copy import deepcopy
-from sklearn.manifold import TSNE
-import cv2
-from torchvision.transforms.transforms import Resize
 import images
 import torch
-import os
 import numpy as np
 from PIL import Image
-from torchvision import transforms as T
 import matplotlib.pyplot as plt
-from torchvision import datasets, transforms
+from torchvision import datasets, transforms as T
 import file_handler
 # from dinov2.models.vision_transformer import vit_small, vit_base
 from torch import nn, optim
 import math
 import concurrent.futures as cf
 from sklearn.neighbors import NearestNeighbors
+from numpy import linalg as LA
 
 class Model:
     def __init__(self, transform_height, transform_width, train_dir=None, test_dir=None, save=None) -> None:
@@ -44,6 +39,7 @@ class Model:
         self.feat_dim = 384 # 384 vits14 | 768 vitb14 | 1024 vitl14 | 1536 vitg14
         self.extracted_features = list()
         self.reordered_feat_mat = None
+        self.eigen_memory = dict()
         self.img_transform = {
             "train": T.Compose([
                 T.Resize(size=(self.transform_height, self.transform_width)),
@@ -178,12 +174,12 @@ class Model:
         if len(self.extracted_features) == 0 or force==True:
             self.extracted_features = self.file_handler.load_data(pkl_path)
         return self.extracted_features
+    
+    def load_eigen_mem(self, pkl_path, force=False):
+        if len(self.eigen_memory.keys()) == 0 or force==True:
+            self.eigen_memory = self.file_handler.load_data(pkl_path)
+        return self.eigen_memory
 
-    def calc_eigen_vect_var(self, all_features, k=3):
-        N = all_features[-1].shape # dim of test point feature f
-        S = N//k # divide into S sets
-        L = k # dim of subfeature vectors. So more samples used to calculate the Eigen vectors = larger L
-        pass
     
     def reorder_features(self, k=3):
         assert len(self.extracted_features)!=0 , 'Load features first!'
@@ -236,3 +232,32 @@ class Model:
         assert len(set(reordered_indices)) == self.feat_dim, "Feature reorder error!"
         self.reordered_feat_mat = feat_mat[:, reordered_indices]
         return self.reordered_feat_mat
+
+    def calc_eigen_in_sets(self, neighbor_features_mat, S, L):
+        set_matrices = [neighbor_features_mat[:, i*L:(i+1)*L] for i in range(S)]
+        all_eigenvals = list()
+        all_eigenvects = list()
+        for submatrix in set_matrices:
+            eigenvalues, eigenvectors = LA.eig(submatrix) # normalized eigenvectors (each column)
+            all_eigenvals.append(eigenvalues)
+            all_eigenvects.append(eigenvectors)
+        return (all_eigenvals, all_eigenvects)
+
+    def knnn(self, pkl_dump_path, pkl_file_name, k=3, exclude_test_point=True):
+        assert self.reordered_feat_mat is not None, 'Reorder features first!'
+        N = self.feat_dim # dim of test point feature f (same for all points)
+        S = N//k # divide into S sets
+        L = k # dim of subfeature vectors. So more samples used to calculate the Eigen vectors = larger L
+        if exclude_test_point:
+            neigh = NearestNeighbors(n_neighbors=k+1)
+        else:
+            neigh = NearestNeighbors(n_neighbors=k)
+        neigh.fit(self.reordered_feat_mat)
+        for i, f in enumerate(self.reordered_feat_mat):
+            neighbors = neigh.kneighbors([f]) # returns ([distances], [indices]). Eg: (array([[9.14509525e-04, 1.09526892e+03, 1.12253833e+03]]), array([[0, 1, 7]]))
+            neighbor_indices = neighbors[1][0]
+            if exclude_test_point: # the first point should NearestNeighbors be the test point but this is to be extra sure
+                neighbor_indices = np.delete(neighbor_indices, np.argwhere(neighbor_indices==i)) 
+            neighbor_features_mat = self.reordered_feat_mat[neighbor_indices]
+            self.eigen_memory[i] = self.calc_eigen_in_sets(neighbor_features_mat, S, L)
+        self.file_handler.dump_data(self.eigen_memory, pkl_dump_path, pkl_file_name)

@@ -21,15 +21,17 @@ def driver():
     TRAIN_DIR = f'data/output.nosync/Chest-RSNA/train_512_512_1000_1/{GOOD_UNGOOD}' # will be same as SAVE_DIR if used after VisibilityDetection
     PKL_DUMP_PATH = f'data/pickles/'
     PKL_FILE_NAME = f'{TEST_OR_TRAIN}_{IMG_HEIGHT}_{IMG_WIDTH}_{A0}_{A1}_{GOOD_UNGOOD}_hundred'
+    EIGEN_PKL_FILE_NAME = f'{TEST_OR_TRAIN}_{IMG_HEIGHT}_{IMG_WIDTH}_{A0}_{A1}_{GOOD_UNGOOD}_hundred_eigen'
     K = 3
 
     # chest_train_img_processor = img_processing.VisibilityDetection(SRC_DIR, img_height=IMG_HEIGHT, img_width=IMG_WIDTH, a0=A0, a1=A1, save=SAVE_DIR)
     # chest_train_img_processor.run()
 
     chest_train_model = model.Model(IMG_HEIGHT, IMG_WIDTH, train_dir=TRAIN_DIR)
-    # chest_train_model.extract_features(PKL_DUMP_PATH, PKL_FILE_NAME, concurrent=True)
+    chest_train_model.extract_features(PKL_DUMP_PATH, PKL_FILE_NAME, concurrent=True)
     chest_train_model.load_features(f'{PKL_DUMP_PATH}/{PKL_FILE_NAME}')
     chest_train_model.reorder_features(k=K)
-
+    chest_train_model.knnn(PKL_DUMP_PATH, EIGEN_PKL_FILE_NAME, k=K)
+    chest_train_model.load_eigen_mem(f'{PKL_DUMP_PATH}/{EIGEN_PKL_FILE_NAME}')
 
 driver()
