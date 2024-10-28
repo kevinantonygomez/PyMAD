@@ -43,6 +43,7 @@ class Model:
         self.patch_w = self.patch_based_width//self.patch_size
         self.feat_dim = 384 # 384 vits14 | 768 vitb14 | 1024 vitl14 | 1536 vitg14
         self.extracted_features = list()
+        self.reordered_feat_mat = None
         self.img_transform = {
             "train": T.Compose([
                 T.Resize(size=(self.transform_height, self.transform_width)),
@@ -151,14 +152,16 @@ class Model:
         image.data = Image.open(image.path).convert('RGB')
         img = self.img_transform['embedding'](image.data).unsqueeze(0)
         with torch.no_grad():
-            features = self.dino.forward_features(img)["x_norm_patchtokens"]
+            features = self.dino(img)
+            # features = self.dino.forward_features(img)["x_norm_patchtokens"]
         return image.path, features
         
 
     def extract_features(self, pkl_dump_path, pkl_file_name, concurrent=True):
+        self.dino.eval()
         if concurrent:
             with cf.ThreadPoolExecutor() as executor:
-                future_to_image = {executor.submit(self._extract_features, image): image for image in self.images.images[:10]}
+                future_to_image = {executor.submit(self._extract_features, image): image for image in self.images.images[:100]}
                 for future in cf.as_completed(future_to_image):
                     image_path, features = future.result()
                     print(image_path)
@@ -171,8 +174,9 @@ class Model:
         self.file_handler.dump_data(self.extracted_features, pkl_dump_path, pkl_file_name)
         return self.extracted_features
     
-    def load_features(self, pkl_path):
-        self.extracted_features = self.file_handler.load_data(pkl_path)
+    def load_features(self, pkl_path, force=False):
+        if len(self.extracted_features) == 0 or force==True:
+            self.extracted_features = self.file_handler.load_data(pkl_path)
         return self.extracted_features
 
     def calc_eigen_vect_var(self, all_features, k=3):
@@ -180,76 +184,55 @@ class Model:
         S = N//k # divide into S sets
         L = k # dim of subfeature vectors. So more samples used to calculate the Eigen vectors = larger L
         pass
+    
+    def reorder_features(self, k=3):
+        assert len(self.extracted_features)!=0 , 'Load features first!'
 
-    def knnn(self, k=3):
-        if len(self.extracted_features) == 0:
-            print("Load features first!")
-            raise Exception
-        neigh = NearestNeighbors(n_neighbors=k)
-        # v's original shape = (1, (self.patch_h)^2, feat_dim)
-        # example: (1, 1369, 384) so 1369 = (518/14)^2
-        samples = [v.view(-1).numpy() for (p,v) in self.extracted_features] 
-        print(samples[0])
-        neigh.fit(samples)
-        for e_f_ind, (p,f) in enumerate(self.extracted_features):
-            neighbors = neigh.kneighbors([f.view(-1).numpy()]) # example return: (array([[9.14509525e-04, 1.09526892e+03, 1.12253833e+03]]), array([[0, 1, 7]]))
-            neighbor_indices = neighbors[1][0]
-            try:
-                all_features = [samples[i] for i in neighbor_indices] # add in all the neighbors
-                all_features.append(samples[e_f_ind]) # add in the the test point feature
-                self.calc_eigen_vect_var(all_features, k)
-                # for i in neighbor_indices:
-                #     print(i)
-                #     self.calc_eignevalues(k)
-                    # im = cv2.imread(self.extracted_features[i][0], cv2.IMREAD_GRAYSCALE)
-                    # cv2.imshow(f"{self.extracted_features[i][0]}", im)
-                # cv2.waitKey(0)
-            except:
-                pass
-            quit()
-        
-
-            
-
-
-
-# import torch
-# from PIL import Image
-# import torchvision.transforms as T
-# dinov2_vits14 = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
-# patch_size = dinov2_vits14.patch_size
-# img = Image.open('data/output.nosync/Chest-RSNA/train_512_512_1000_1/good/Normal-5a2f8c86-f21d-4815-98a3-1bb5fa6d9f44.png').convert('RGB')
-
-# transform = T.Compose([
-# T.Resize(518),
-# T.CenterCrop(518),
-# T.ToTensor(),
-# T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-# ])
-# patch_h  = 518//patch_size
-# patch_w  = 518//patch_size
-
-# feat_dim = 384 # vits14
-
-# img = transform(img).unsqueeze(0)
-
-# with torch.no_grad():
-#     features = dinov2_vits14.forward_features(img)["x_norm_patchtokens"]
-
-# print(features.shape)
-# features = features.squeeze(0)
-# print(features.shape)
-# import matplotlib.pyplot as plt
-# import numpy as np
-# from sklearn.decomposition import PCA
-
-# pca = PCA(n_components=3)
-# pca.fit(features)
-
-# pca_features = pca.transform(features)
-# pca_features = (pca_features - pca_features.min()) / (pca_features.max() - pca_features.min())
-# pca_features = pca_features * 255
-# print(pca_features.shape)
-# plt.imshow(pca_features.reshape(37, 37, 3).astype(np.uint8))
-
-# plt.show()
+        ''' v's original shape = (1, (self.patch_h)^2, feat_dim) if using forward_features to extract features
+            v's original shape = (1, feat_dim) if not
+            below flattens to 1369*384 or (self.patch_h)^2*feat_dim if using forward_features to extract features
+            below flattens to 1369*384 or (self.patch_h)^2*feat_dim if using forward_features to extract features'''
+        feat_mat = np.array([v.view(-1).numpy() for (p,v) in self.extracted_features]) 
+        N = self.feat_dim # dim of test point feature f (same for all points)
+        S = N//k # divide into S sets
+        L = k # dim of subfeature vectors. So more samples used to calculate the Eigen vectors = larger L
+        corr_matrix = np.corrcoef(feat_mat, rowvar=False) # find correlation between all pairs in training set
+        reordered_indices = list()
+        curr_ind = 0
+        set_num = 0
+        m = np.zeros(N, dtype=bool)
+        m[reordered_indices] = True
+        while curr_ind < N:
+            for j in range(L):
+                if j == 0: # the first element selection differs
+                    if set_num == 0:
+                        reordered_indices.append(0)
+                        m[curr_ind] = True # curr_ind is 0 here
+                    else:
+                        prev_index = reordered_indices[curr_ind-1]
+                        prev_prev_index = reordered_indices[curr_ind-2]
+                        arr1 = np.ma.array(corr_matrix[prev_prev_index], mask=m)
+                        arr2 = np.ma.array(corr_matrix[prev_index], mask=m)
+                        mean_arr = np.ma.mean(np.ma.array([arr1, arr2]), axis=0)
+                        min_avg_cor_to_prev_two_ind = np.argmin(mean_arr)
+                        reordered_indices.append(min_avg_cor_to_prev_two_ind)
+                        m[min_avg_cor_to_prev_two_ind] = True
+                elif j == 1:
+                    max_cor_to_prev_ind = np.argmax(np.ma.array(corr_matrix[reordered_indices[curr_ind-1]], mask=m))
+                    reordered_indices.append(max_cor_to_prev_ind)
+                    m[max_cor_to_prev_ind] = True
+                    # print(max_cor_to_prev_ind, corr_matrix[0, max_cor_to_prev_ind])
+                else:
+                    prev_index = reordered_indices[curr_ind-1]
+                    prev_prev_index = reordered_indices[curr_ind-2]
+                    arr1 = np.ma.array(corr_matrix[prev_prev_index], mask=m)
+                    arr2 = np.ma.array(corr_matrix[prev_index], mask=m)
+                    mean_arr = np.ma.mean(np.ma.array([arr1, arr2]), axis=0)
+                    max_avg_cor_to_prev_two_ind = np.argmax(mean_arr)
+                    reordered_indices.append(max_avg_cor_to_prev_two_ind)
+                    m[max_avg_cor_to_prev_two_ind] = True
+                curr_ind += 1
+            set_num += 1
+        assert len(set(reordered_indices)) == self.feat_dim, "Feature reorder error!"
+        self.reordered_feat_mat = feat_mat[:, reordered_indices]
+        return self.reordered_feat_mat
