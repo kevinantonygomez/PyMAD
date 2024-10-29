@@ -1,6 +1,7 @@
 '''
 Main k-nnn + CNN model
 '''
+from sklearn.externals._packaging.version import InvalidVersion
 import images
 import torch
 import numpy as np
@@ -59,6 +60,22 @@ class Model:
                 ]
             )
         }
+
+    def load_features(self, pkl_path, force=False):
+        if len(self.extracted_features) == 0 or force==True:
+            self.extracted_features = self.file_handler.load_data(pkl_path)
+        return self.extracted_features
+
+    def load_reordered_features(self, pkl_path, force=False):
+        if self.reordered_feat_mat is None or force==True:
+            self.reordered_feat_mat = self.file_handler.load_data(pkl_path)
+        return self.reordered_feat_mat
+    
+    def load_eigen_mem(self, pkl_path, force=False):
+        if len(self.eigen_memory.keys()) == 0 or force==True:
+            self.eigen_memory = self.file_handler.load_data(pkl_path)
+        return self.eigen_memory
+
 
     def _type_check(self, obj_name:str, obj, type)->bool:
         '''
@@ -144,12 +161,19 @@ class Model:
             epoch_accuracies.append(epoch_accuracy)
             print("  -> Epoch {}: Loss = {:.5f}, Accuracy = {:.3f}%".format(epoch, epoch_losses[-1], 100*epoch_accuracy))
 
+
     def _extract_features(self, image):
-        image.data = Image.open(image.path).convert('RGB')
-        img = self.img_transform['embedding'](image.data).unsqueeze(0)
+        if type(image) is str:
+            image_data = Image.open(image).convert('RGB')
+            img = self.img_transform['embedding'](image_data).unsqueeze(0)
+        else:
+            image.data = Image.open(image.path).convert('RGB')
+            img = self.img_transform['embedding'](image.data).unsqueeze(0)
         with torch.no_grad():
             features = self.dino(img)
             # features = self.dino.forward_features(img)["x_norm_patchtokens"]
+        if type(image) is str:
+            return image, features
         return image.path, features
         
 
@@ -157,7 +181,7 @@ class Model:
         self.dino.eval()
         if concurrent:
             with cf.ThreadPoolExecutor() as executor:
-                future_to_image = {executor.submit(self._extract_features, image): image for image in self.images.images[:100]}
+                future_to_image = {executor.submit(self._extract_features, image): image for image in self.images.images}
                 for future in cf.as_completed(future_to_image):
                     image_path, features = future.result()
                     print(image_path)
@@ -170,18 +194,8 @@ class Model:
         self.file_handler.dump_data(self.extracted_features, pkl_dump_path, pkl_file_name)
         return self.extracted_features
     
-    def load_features(self, pkl_path, force=False):
-        if len(self.extracted_features) == 0 or force==True:
-            self.extracted_features = self.file_handler.load_data(pkl_path)
-        return self.extracted_features
     
-    def load_eigen_mem(self, pkl_path, force=False):
-        if len(self.eigen_memory.keys()) == 0 or force==True:
-            self.eigen_memory = self.file_handler.load_data(pkl_path)
-        return self.eigen_memory
-
-    
-    def reorder_features(self, k=3):
+    def reorder_features(self, pkl_dump_path, pkl_file_name, k=3):
         assert len(self.extracted_features)!=0 , 'Load features first!'
 
         ''' v's original shape = (1, (self.patch_h)^2, feat_dim) if using forward_features to extract features
@@ -231,33 +245,73 @@ class Model:
             set_num += 1
         assert len(set(reordered_indices)) == self.feat_dim, "Feature reorder error!"
         self.reordered_feat_mat = feat_mat[:, reordered_indices]
+        self.file_handler.dump_data(self.reordered_feat_mat, pkl_dump_path, pkl_file_name)
         return self.reordered_feat_mat
 
     def calc_eigen_in_sets(self, neighbor_features_mat, S, L):
         set_matrices = [neighbor_features_mat[:, i*L:(i+1)*L] for i in range(S)]
         all_eigenvals = list()
         all_eigenvects = list()
+        # c = 0
         for submatrix in set_matrices:
             eigenvalues, eigenvectors = LA.eig(submatrix) # normalized eigenvectors (each column)
+            # if np.any(eigenvalues < 0):
+            #     c+=1
             all_eigenvals.append(eigenvalues)
             all_eigenvects.append(eigenvectors)
         return (all_eigenvals, all_eigenvects)
 
-    def knnn(self, pkl_dump_path, pkl_file_name, k=3, exclude_test_point=True):
+    def calc_anomaly_score(self, f, neighbor_features_mat, eigen_mem, S, L, k=3):
+        neigh_sets = [neighbor_features_mat[:, i*L:(i+1)*L] for i in range(S)]
+        f_sets = [f[i*L:(i+1)*L] for i in range(S)]
+        score = 0
+        for i in range(k):
+            for j in range(k):
+                for s in range(S):
+                    # print(len(eigen_mem[i][0]))
+                    # print(len(eigen_mem[i][1]))
+                    # print(neigh_sets)
+                    # print('\n')
+                    # print(neigh_sets[s][i])
+                    # print(f_sets[s] - neigh_sets[s][i])
+                    a = np.abs(np.dot(f_sets[s] - neigh_sets[s][i], eigen_mem[i][1][s][j]))
+                    b = 1/np.emath.sqrt(eigen_mem[i][0][s][j])
+                    score += np.dot(a,b)
+                    # print(a,b)
+                    # print(score)
+        print(score)
+
+
+    def knnn(self, pkl_dump_path, pkl_file_name, mode, k=3, exclude_test_point=True):
         assert self.reordered_feat_mat is not None, 'Reorder features first!'
         N = self.feat_dim # dim of test point feature f (same for all points)
         S = N//k # divide into S sets
         L = k # dim of subfeature vectors. So more samples used to calculate the Eigen vectors = larger L
-        if exclude_test_point:
+        if exclude_test_point and mode == 'train':
             neigh = NearestNeighbors(n_neighbors=k+1)
         else:
             neigh = NearestNeighbors(n_neighbors=k)
         neigh.fit(self.reordered_feat_mat)
-        for i, f in enumerate(self.reordered_feat_mat):
-            neighbors = neigh.kneighbors([f]) # returns ([distances], [indices]). Eg: (array([[9.14509525e-04, 1.09526892e+03, 1.12253833e+03]]), array([[0, 1, 7]]))
-            neighbor_indices = neighbors[1][0]
-            if exclude_test_point: # the first point should NearestNeighbors be the test point but this is to be extra sure
-                neighbor_indices = np.delete(neighbor_indices, np.argwhere(neighbor_indices==i)) 
-            neighbor_features_mat = self.reordered_feat_mat[neighbor_indices]
-            self.eigen_memory[i] = self.calc_eigen_in_sets(neighbor_features_mat, S, L)
-        self.file_handler.dump_data(self.eigen_memory, pkl_dump_path, pkl_file_name)
+        if mode == 'train':
+            for i, f in enumerate(self.reordered_feat_mat):
+                neighbors = neigh.kneighbors([f]) # returns ([distances], [indices]). Eg: (array([[9.14509525e-04, 1.09526892e+03, 1.12253833e+03]]), array([[0, 1, 7]]))
+                neighbor_indices = neighbors[1][0]
+                if exclude_test_point: # the first point should be the test point but this is to be extra sure
+                    neighbor_indices = np.delete(neighbor_indices, np.argwhere(neighbor_indices==i)) 
+                neighbor_features_mat = self.reordered_feat_mat[neighbor_indices]
+                self.eigen_memory[i] = self.calc_eigen_in_sets(neighbor_features_mat, S, L)
+            self.file_handler.dump_data(self.eigen_memory, pkl_dump_path, pkl_file_name)
+
+        elif mode == 'test':
+            assert len(self.eigen_memory.keys()) != 0, 'Load eigen memory first!'
+            for image in self.images.images:
+                f = self._extract_features(image.path)[1].view(-1).numpy()
+                neighbors = neigh.kneighbors([f])
+                neighbor_indices = neighbors[1][0]
+                neighbor_features_mat = self.reordered_feat_mat[neighbor_indices] 
+                req_eigen_mem = {i: self.eigen_memory[key] for i, key in enumerate(neighbor_indices)}
+                self.calc_anomaly_score(f, neighbor_features_mat, req_eigen_mem, S, L, k=k)
+
+        else:
+            print(f'Invalid value for mode: {mode}')
+            raise ValueError
