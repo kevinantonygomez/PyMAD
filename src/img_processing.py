@@ -20,8 +20,8 @@ class VisibilityDetection:
         assert min(self.scaled_coords_y.values()) >= -0.5, f'Coordinate Scaling error! Got {min(self.scaled_coords_y.values())}'
         assert max(self.scaled_coords_x.values()) <= 0.5, f'Coordinate Scaling error! Got {max(self.scaled_coords_x.values())}'
         assert max(self.scaled_coords_y.values()) <= 0.5, f'Coordinate Scaling error! Got {max(self.scaled_coords_y.values())}'
-        self.a0 = a0 # When a0 is high, even the deepest valleys (or areas of low intensity) remain far from the viewpoint.
-        self.a1 = a1 # When setting a1 to high values, the transformation will result in significant valleys and ridges even when the pixels that created them had similar intensity values.
+        self.a0 = int(a0) # When a0 is high, even the deepest valleys (or areas of low intensity) remain far from the viewpoint.
+        self.a1 = int(a1) # When setting a1 to high values, the transformation will result in significant valleys and ridges even when the pixels that created them had similar intensity values.
         
 
     def vis_3d(self, points, intensity_list, title='Figure'):
@@ -57,7 +57,7 @@ class VisibilityDetection:
     def cartesian_to_spherical(self, x, y, z, i):
         theta = math.atan2(y, x) # azimuth angle (radians)
         phi = math.atan2(math.sqrt(x**2 + y**2), z) # polar angle (radians)
-        r = (self.a1 * i) + self.a0
+        r = (self.a1 * int(i)) + self.a0
         return (r, theta, phi)
 
     def spherical_to_cartesian(self, r, theta, phi):

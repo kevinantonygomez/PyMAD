@@ -183,3 +183,5 @@ data/images.nosync
 data/output.nosync
 data/pickles.nosync
 src/img_size_change.py
+.vscode
+pickles_old
