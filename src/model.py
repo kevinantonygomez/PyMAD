@@ -1,217 +1,216 @@
 '''
 Main k-nnn + CNN model
 '''
-from sklearn.externals._packaging.version import InvalidVersion
-import images
+import images as images_class
 import torch
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
-from torchvision import datasets, transforms as T
+from torchvision import transforms as T
 import file_handler
 # from dinov2.models.vision_transformer import vit_small, vit_base
-from torch import nn, optim
 import math
 import concurrent.futures as cf
 from sklearn.neighbors import NearestNeighbors
 from numpy import linalg as LA
 from tqdm import tqdm
-import cv2
+from sklearn.metrics import roc_curve, roc_auc_score, average_precision_score
+from scipy.cluster.hierarchy import dendrogram, linkage
+from scipy.spatial.distance import squareform
+from scipy.cluster.hierarchy import fcluster
+
 
 class Model:
-    def __init__(self, transform_height, transform_width, train_dir=None, test_dir=None, save=None) -> None:
-        self.transform_height = transform_height
-        self.transform_width = transform_width
+    def __init__(self, KNNN_CONFIG:dict) -> None:
+        self.dataset_name = KNNN_CONFIG['dataset_name']
+        self.transform_height = KNNN_CONFIG['transform_height']
+        self.transform_width = KNNN_CONFIG['transform_width']
+        self.train_data_path = KNNN_CONFIG['train_data_path']
+        self.test_data_path_good = KNNN_CONFIG['test_data_path'][0]
+        self.test_data_path_ungood = KNNN_CONFIG['test_data_path'][1]
+        self.output_root_path = KNNN_CONFIG['output_root_path']
+        self.set_size = KNNN_CONFIG['set_size']
+        self.nn = KNNN_CONFIG['nn']
+        self.n = KNNN_CONFIG['n']
+        self.embedding_model = KNNN_CONFIG['embedding_model'] 
+        self.img_prep_type = KNNN_CONFIG['img_prep_type']
         self.file_handler = file_handler.FileHandler()
-        if train_dir is not None:
-            self.train_dir = self.file_handler.check_folder(train_dir)
-            self.images = images.Images(self.train_dir, save)
-        elif test_dir is not None:
-            self.test_dir = self.file_handler.check_folder(test_dir)
-            self.images = images.Images(self.test_dir, save)
-        else:
-            print('train_dir and test_dir cannot both be None')
-            raise ValueError
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        self.dino = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
+        self.dino = torch.hub.load("facebookresearch/dinov2", self.embedding_model)
+        if self.embedding_model == 'dinov2_vits14':
+            self.feat_dim = 384 # 384 vits14 | 768 vitb14 | 1024 vitl14 | 1536 vitg14
+        elif self.embedding_model == 'dinov2_vitb14':
+            self.feat_dim = 768
         self.patch_size = self.dino.patch_size
-        self.patch_based_height = math.ceil(self.transform_height/self.patch_size)*self.patch_size
+        self.patch_based_height = math.ceil(self.transform_height/self.patch_size)*self.patch_size # ensure dims work with selected model
         self.patch_based_width = math.ceil(self.transform_width/self.patch_size)*self.patch_size
-        self.patch_h = self.patch_based_height//self.patch_size
-        self.patch_w = self.patch_based_width//self.patch_size
-        self.feat_dim = 384 # 384 vits14 | 768 vitb14 | 1024 vitl14 | 1536 vitg14
-        self.extracted_features = list()
-        self.reordered_feat_mat = None
-        self.eigen_memory = dict()
         self.img_transform = {
-            "train": T.Compose([
-                T.Resize(size=(self.transform_height, self.transform_width)),
-                T.CenterCrop(518),
-                T.RandomRotation(360),
-                T.RandomHorizontalFlip(),
-                T.RandomVerticalFlip(),
-                T.ToTensor(),
-                T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-                ]
-            ),
             "embedding": T.Compose([
                 T.Resize(size=(self.patch_based_height, self.patch_based_width)),
                 T.CenterCrop(size=(self.patch_based_height, self.patch_based_width)),
                 T.ToTensor(),
-                # T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-                T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+                T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+                # T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
                 ]
             )
         }
-
-    def load_features(self, pkl_path, force=False):
-        if len(self.extracted_features) == 0 or force==True:
-            self.extracted_features = self.file_handler.load_data(pkl_path)
-        return self.extracted_features
-
-    def load_reordered_features(self, pkl_path, force=False):
-        if self.reordered_feat_mat is None or force==True:
-            self.reordered_feat_mat = self.file_handler.load_data(pkl_path)
-        return self.reordered_feat_mat
-    
-    def load_eigen_mem(self, pkl_path, force=False):
-        if len(self.eigen_memory.keys()) == 0 or force==True:
-            self.eigen_memory = self.file_handler.load_data(pkl_path)
-        return self.eigen_memory
-
-
-    def _type_check(self, obj_name:str, obj, type)->bool:
-        '''
-        Private method to type check an object
-        :param obj_name: variable name
-        :param obj: actual obj
-        :param type: expected type of obj
-        '''
-        try:
-            if not isinstance(obj, type):
-                print(f'!!! {obj_name} should be of type {type} not {type(obj)}')
-            else:
-                return True
-        except Exception as e:
-            print(f"!!! Error in _type_check: \n {e}")
-        return False
-    
-
-    def _extract_features(self, image):
-        if type(image) is str:
-            image_data = Image.open(image).convert('RGB')
-            img = self.img_transform['embedding'](image_data).unsqueeze(0)
-        else:
-            image.data = Image.open(image.path).convert('RGB')
-            img = self.img_transform['embedding'](image.data).unsqueeze(0)
-            # x = self.img_transform['embedding'](image.data)
-            # x = x.numpy()
-            # x = np.transpose(x, (1, 2, 0))
-            # cv2.imshow('im', x)
-            # cv2.waitKey(0)
-            # cv2.destroyAllWindows()
-            # quit()
-        with torch.no_grad():
-            features = self.dino(img)
-            # features = self.dino.forward_features(img)["x_norm_patchtokens"]
-        if type(image) is str:
-            return image, features
-        return image.path, features
+        self.features_clusters = None
+        self.reordered_features = None
+        self.eigen_memory = None
         
 
-    def extract_features(self, pkl_dump_path, pkl_file_name, concurrent=True, select_images=None):
-        assert len(self.images.images) != 0, 'No images!'
-        num_images = len(self.images.images)
-        assert select_images is None \
-            or (type(select_images) is int and select_images > 0 and select_images <= num_images), 'Invalid select_images val'
+    def _extract_features(self, image:images_class.Image):
+        image.data = Image.open(image.path).convert('RGB')
+        img = self.img_transform['embedding'](image.data).unsqueeze(0)
+        with torch.no_grad():
+            features = self.dino(img)
+        features = features.view(-1).numpy() # flatten
+        return features
+        
+
+    def extract_features(self, src_path:str, concurrent=True, select_images=None):
+        try:
+            images = images_class.Images(src_path)
+        except Exception as e:
+            print(e)
+            return
+        assert len(images.images) != 0, 'No images!'
+        num_images = len(images.images)
+        assert select_images is None or (type(select_images) is int and select_images > 0 and select_images <= num_images), 'Invalid value for select_images'
         if select_images is not None:
             num_images = select_images
         self.dino.eval()
+        extracted_features = list()
         if concurrent:
             with cf.ThreadPoolExecutor() as executor:
-                future_to_image = {executor.submit(self._extract_features, image): image for image in self.images.images[:num_images]}
-                for future in tqdm(cf.as_completed(future_to_image), total=len(future_to_image), desc='Extracting img features'):
-                    image_path, features = future.result()
-                    # print(image_path)
-                    self.extracted_features.append(features.view(-1).numpy())
+                future_to_image = {executor.submit(self._extract_features, image): image for image in images.images[:num_images]}
+                for future in tqdm(cf.as_completed(future_to_image), total=len(future_to_image), desc=f'Extracting img features from {src_path}'):
+                    features = future.result()
+                    extracted_features.append(features)
         else:
-            for image in self.images.images:
-                image_path, features = self._extract_features(image)
-                print(image_path, features.shape)
-                self.extracted_features.append((image_path, features))
-        self.extracted_features = np.array(self.extracted_features)
-        self.file_handler.dump_data(self.extracted_features, pkl_dump_path, pkl_file_name)
-        return self.extracted_features
-    
-    def compute_correlation_matrix(self, data):
+            for image in images.images:
+                features = self._extract_features(image)
+                extracted_features.append(features)
+        extracted_features = np.array(extracted_features)
+        return extracted_features
+
+
+    def hierarchical_clustering(self, correlation_matrix, do_plot=False):
+        # Transform the correlation matrix to a distance matrix
+        distance_matrix = 1 - np.abs(correlation_matrix)
+        distance_matrix = distance_matrix.astype(np.float32) # original float64 causes symmetric matrix issues in squareform
+        # Ensure the diagonal elements are zero
+        np.fill_diagonal(distance_matrix, 0)
+        # Perform hierarchical/agglomerative clustering
+        Z = linkage(squareform(distance_matrix), method='average')
+        if do_plot:
+            dendrogram(Z)
+            plt.title('Hierarchical Cluster Dendrogram')
+            plt.xlabel('Data Point Indexes')
+            plt.ylabel('Distance')
+            plt.show()
+        return Z
+
+
+    def equal_size_clustering(self, Z, m, target_size):
         """
-        Computes the correlation matrix for a given 2D NumPy array.
+        Divides features into approximately equal-sized clusters.
         
-        :param data: A 2D NumPy array of size [n, m] where n is the number of samples
-                    and m is the number of features.
-        :return: The correlation matrix of size [m, m].
+        :param Z: Linkage matrix from hierarchical clustering.
+        :param m: Total number of features.
+        :param target_size: Desired number of features in each cluster.
+        :return: Array indicating cluster membership for each feature.
         """
-        # Standardize each feature (column) to have mean 0 and variance 1
-        standardized_data = (data - np.mean(data, axis=0)) / np.std(data, axis=0, ddof=1)
+        
+        if m % target_size != 0:
+            raise ValueError("Number of features target_size must be a divisor of number of features m")
+        k = m // target_size
+        # Initial clustering
+        initial_clusters = fcluster(Z, k, criterion='maxclust')
+        # If the initial clustering does not result in k clusters, we need to adjust it
+        for cluster_ind in range(1, k + 1):
+            cluster_size = np.sum(initial_clusters == cluster_ind) 
+            if cluster_size == 0:
+                # find non empty cluster
+                for i in range(1, k + 1):
+                    if i != cluster_ind:
+                        cluster_size_other = np.sum(initial_clusters == i) 
+                        if cluster_size_other > target_size:
+                            # change an elemnet to be of the other 
+                            initial_clusters[np.where(initial_clusters == i)[0][0]] = cluster_ind
+                            break
+        
+        # Target size for each cluster
+        target_size = m // k
 
-        # Compute the correlation matrix
-        correlation_matrix = np.dot(standardized_data.T, standardized_data) / (data.shape[0] - 1)
+        # Create a list to hold the merge level for each feature
+        merge_levels = np.zeros(2 * m - 1)
 
-        return correlation_matrix
+        # Fill in the merge levels from the linkage matrix
+        for i in range(m - 1):
+            cluster_formed = int(Z[i, 0]), int(Z[i, 1])
+            for j in cluster_formed:
+                merge_levels[j] = Z[i, 2]
+
+        # Adjustment for equal size
+        for cluster_id in range(1, k + 1):
+            while np.sum(initial_clusters == cluster_id) > target_size:
+                # Find the loosest feature in this cluster
+                indices_in_cluster = np.where(initial_clusters == cluster_id)[0]
+                loosest_feature = indices_in_cluster[np.argmax(merge_levels[indices_in_cluster])]
+
+                # Find the closest cluster to move the loosest feature into
+                closest_cluster = None
+                min_distance = np.inf
+                for i in range(1, k + 1):
+                    if i != cluster_id and np.sum(initial_clusters == i) < target_size:
+                        indices_in_other_cluster = np.where(initial_clusters == i)[0]
+                        if indices_in_other_cluster.size > 0:
+                            cluster_distances = merge_levels[indices_in_other_cluster + m - 1]  # Adjust indices for clusters
+                            distance = np.abs(merge_levels[loosest_feature + m - 1] - cluster_distances.mean())  # Adjust index for current feature
+                            if distance < min_distance:
+                                min_distance = distance
+                                closest_cluster = i
+
+                # Move the feature to the closest cluster
+                if closest_cluster is not None:
+                    initial_clusters[loosest_feature] = closest_cluster
+
+        return initial_clusters
+
+        
+    def get_features_clusters(self, data, target_size:int):
+        """
+        Performs hierarchical clustering on features and returns the clusters.
+        
+        :param data: Data matrix with features in columns.
+        :param target_size: Desired number of features in each cluster.
+        :return: Array indicating cluster membership for each feature.
+        """
+        if data.shape[1] < target_size:
+            raise ValueError("Number of target_size must be less than or equal the number of features in the data")
+        if data.shape[1] == target_size or target_size <= 1:
+            return np.zeros(data.shape[1])
+        correlation_matrix = np.corrcoef(data, rowvar=False)
+        Z = self.hierarchical_clustering(np.abs(correlation_matrix))
+        Z = np.where(Z < 0, 0, Z)
+        m = data.shape[1]
+        clusters = self.equal_size_clustering(Z, m, target_size)
+        return clusters
+
+
+    def get_features_sets(self, data, clusters):
+        sets = []
+        for cluster in np.unique(clusters):
+            sets.append(np.ascontiguousarray(data[:, clusters == cluster]))
+        return sets
     
-    def reorder_features(self, pkl_dump_path, pkl_file_name, set_size=3):
-        assert len(self.extracted_features)!=0 , 'Load features first!'
 
-        ''' v's original shape = (1, (self.patch_h)^2, feat_dim) if using forward_features to extract features
-            v's original shape = (1, feat_dim) if not
-            below flattens to 1369*384 or (self.patch_h)^2*feat_dim if using forward_features to extract features
-            below flattens to 384 or feat_dim if not'''
-        feat_mat = self.extracted_features
-        N = self.feat_dim # dim of test point feature f (same for all points)
-        S = N//set_size # divide into S sets
-        L = set_size # dim of subfeature vectors. So more samples used to calculate the Eigen vectors = larger L
-        corr_matrix = np.corrcoef(feat_mat, rowvar=False) # find correlation between all pairs in training set
-        # correlation_matrix = self.compute_correlation_matrix(feat_mat) # verified returns the same as above
-        reordered_indices = list()
-        curr_ind = 0
-        set_num = 0
-        m = np.zeros(N, dtype=bool)
-        m[reordered_indices] = True
-        while curr_ind < N:
-            for j in range(L):
-                if j == 0: # the first element selection differs
-                    if set_num == 0:
-                        reordered_indices.append(0)
-                        m[curr_ind] = True # curr_ind is 0 here
-                    else:
-                        prev_index = reordered_indices[curr_ind-1]
-                        prev_prev_index = reordered_indices[curr_ind-2]
-                        arr1 = np.ma.array(corr_matrix[prev_prev_index], mask=m)
-                        arr2 = np.ma.array(corr_matrix[prev_index], mask=m)
-                        mean_arr = np.ma.mean(np.ma.array([arr1, arr2]), axis=0)
-                        min_avg_cor_to_prev_two_ind = np.argmin(mean_arr)
-                        reordered_indices.append(min_avg_cor_to_prev_two_ind)
-                        m[min_avg_cor_to_prev_two_ind] = True
-                elif j == 1:
-                    max_cor_to_prev_ind = np.argmax(np.ma.array(corr_matrix[reordered_indices[curr_ind-1]], mask=m))
-                    reordered_indices.append(max_cor_to_prev_ind)
-                    m[max_cor_to_prev_ind] = True
-                    # print(max_cor_to_prev_ind, corr_matrix[0, max_cor_to_prev_ind])
-                else:
-                    prev_index = reordered_indices[curr_ind-1]
-                    prev_prev_index = reordered_indices[curr_ind-2]
-                    arr1 = np.ma.array(corr_matrix[prev_prev_index], mask=m)
-                    arr2 = np.ma.array(corr_matrix[prev_index], mask=m)
-                    mean_arr = np.ma.mean(np.ma.array([arr1, arr2]), axis=0)
-                    max_avg_cor_to_prev_two_ind = np.argmax(mean_arr)
-                    reordered_indices.append(max_avg_cor_to_prev_two_ind)
-                    m[max_avg_cor_to_prev_two_ind] = True
-                curr_ind += 1
-            set_num += 1
-        assert len(set(reordered_indices)) == self.feat_dim, "Feature reorder error!"
-        self.reordered_feat_mat = feat_mat[:, reordered_indices]
-        self.file_handler.dump_data(self.reordered_feat_mat, pkl_dump_path, pkl_file_name)
-        return self.reordered_feat_mat
+    def reorder_features(self, extracted_features, features_clusters):
+        feature_sets = self.get_features_sets(extracted_features, features_clusters)
+        reordered_feat_mat = np.concatenate(feature_sets, axis=1)
+        return reordered_feat_mat
+
 
     def calc_eigen_in_sets(self, neighbor_features_mat, S, L):
         set_matrices = [neighbor_features_mat[:, i*L:(i+1)*L] for i in range(S)]
@@ -219,85 +218,133 @@ class Model:
         all_eigenvects = list()
         for submatrix in set_matrices:
             cov_matrix = np.cov(submatrix, rowvar=False)
+            inverse_covariance_matrix = np.linalg.inv(cov_matrix)
             try:
-                eigenvalues, eigenvectors = LA.eig(cov_matrix)  # normalized eigenvectors (each column)
+                eigenvalues, eigenvectors = LA.eig(inverse_covariance_matrix)  # normalized eigenvectors (each column)
+                eigenvectors = eigenvectors.T # make it each row
             except:
                 print("Eigenvector calc exception")
                 # If the covariance matrix is singular, use just an identity matrix
                 eigenvalues = np.ones(cov_matrix.shape[0])
                 eigenvectors = np.eye(cov_matrix.shape[0])
-
             all_eigenvals.append(eigenvalues)
             all_eigenvects.append(eigenvectors)
-            # print(eigenvalues)
         return (all_eigenvals, all_eigenvects)
 
-    def calc_anomaly_score(self, f, neighbor_features_mat, eigen_mem, S, L, k=3):
-        neigh_sets = [neighbor_features_mat[:, i*L:(i+1)*L] for i in range(S)]
-        f_sets = [f[i*L:(i+1)*L] for i in range(S)]
+
+    def train(self):
+        parent_path = f'{self.output_root_path}/{self.dataset_name}/{self.embedding_model}_{self.img_prep_type}_{self.transform_height}_{self.transform_width}'
+        features_clusters_name = f'feature_clusters_{self.set_size}'
+        reordered_features_name = f'reordered_{self.set_size}'
+        eigen_mem_name = f'eigen_{self.set_size}_{self.nn}'
+        
+        # only extract features if they haven't been extracted and stored before
+        if not self.file_handler.pkl_exists(f'{parent_path}/train'):
+            extracted_features = self.extract_features(self.train_data_path)
+            self.file_handler.dump_data(extracted_features, parent_path, 'train')
+        else: # read extracted features from mem
+            extracted_features = self.file_handler.load_data(f'{parent_path}/train')
+
+        # only get feature clusters if they haven't been computed and stored before
+        if not self.file_handler.pkl_exists(f'{parent_path}/{features_clusters_name}'):
+            self.features_clusters = self.get_features_clusters(extracted_features, self.set_size)
+            self.file_handler.dump_data(self.features_clusters, parent_path, features_clusters_name)
+        else: # read feature clusters from mem
+            self.features_clusters = self.file_handler.load_data(f'{parent_path}/{features_clusters_name}')
+        
+        # only reorder feature if they haven't been reordered and stored before
+        if not self.file_handler.pkl_exists(f'{parent_path}/{reordered_features_name}'):
+            self.reordered_features = self.reorder_features(extracted_features, self.features_clusters)
+            self.file_handler.dump_data(self.reordered_features, parent_path, reordered_features_name)
+        else:
+            self.reordered_features = self.file_handler.load_data(f'{parent_path}/{reordered_features_name}')
+
+        # only fit if eigen mem not computed and stored before
+        if not self.file_handler.pkl_exists(f'{parent_path}/{eigen_mem_name}'):
+            neigh = NearestNeighbors(n_neighbors=self.nn+1, metric="cosine")
+            neigh.fit(self.reordered_features)
+            N = self.feat_dim # dim of test point feature f (same for all points)
+            S = N//self.set_size # divide into S sets
+            L = self.set_size # dim of subfeature vectors. So more samples used to calculate the Eigen vectors = larger L
+            self.eigen_memory = dict()
+
+            for i, f in tqdm(enumerate(self.reordered_features), total=len(self.reordered_features), desc='Training'):
+                neighbor_indices = neigh.kneighbors([f], return_distance=False)[0] # returns ([distances], [indices]). Eg: (array([[9.14509525e-04, 1.09526892e+03, 1.12253833e+03]]), array([[0, 1, 7]]))
+                neighbor_indices = np.delete(neighbor_indices, np.argwhere(neighbor_indices==i)) 
+                neighbor_features_mat = self.reordered_features[neighbor_indices]
+                self.eigen_memory[i] = self.calc_eigen_in_sets(neighbor_features_mat, S, L)
+
+            self.file_handler.dump_data(self.eigen_memory, parent_path, eigen_mem_name)
+
+        else:
+            self.eigen_memory = self.file_handler.load_data(f'{parent_path}/{eigen_mem_name}')
+
+
+    def make_ds(self, good_feats, ungood_feats):
+        test_features = np.vstack((good_feats, ungood_feats))
+        zeros = np.zeros(good_feats.shape[0]) # 0 = normal or positive class
+        ones = np.ones(ungood_feats.shape[0])
+        test_labels = np.concatenate((zeros, ones))
+        return test_features, test_labels
+
+
+    def calc_anomaly_score(self, f, neighbor_features_mat, eigen_mem, S, L, k):
+        neigh_sets = neighbor_features_mat.reshape(neighbor_features_mat.shape[0], S, L)
+        f_sets = [f[i*L:(i+1)*L] for i in range(S)] # HERE IS THE PROBLEM!!!!!!!
         score = 0
         for i in range(k):
             for j in range(L):
                 for s in range(S):
-                    # print(len(eigen_mem[i][0]))
-                    # print(len(eigen_mem[i][1]))
-                    # print(neigh_sets)
-                    # print('\n')
-                    # print(neigh_sets[s][i])
-                    # print(f_sets[s] - neigh_sets[s][i])
-                    a = np.abs(np.dot(f_sets[s] - neigh_sets[s][i], eigen_mem[i][1][s][j]))
+                    a = np.abs(np.dot(f_sets[s] - neigh_sets[i][s], eigen_mem[i][1][s][j]))
                     assert eigen_mem[i][0][s][j] > 0, f'Negative or zero eigenvalue! {eigen_mem[i][0][s][j]}'
                     b = 1/np.emath.sqrt(eigen_mem[i][0][s][j])
                     score += np.dot(a,b)
-                    # print(a)
-                    # print(b)
-                    # print(a,b)
-                    # print(score)
-                    # quit()
-        # quit()
         return score
 
 
-    def knnn(self, pkl_dump_path, pkl_file_name, mode, k, set_size, exclude_test_point=True, test_ds=set()):
-        assert self.reordered_feat_mat is not None, 'Reorder features first!'
+    def test(self):
+        if self.features_clusters is None or self.reordered_features is None or self.eigen_memory is None:
+            print('Have to load required data from memory. Training first...')
+            self.train()
+        parent_path = f'{self.output_root_path}/{self.dataset_name}/{self.embedding_model}_{self.img_prep_type}_{self.transform_height}_{self.transform_width}'
         N = self.feat_dim # dim of test point feature f (same for all points)
-        S = N//set_size # divide into S sets
-        L = set_size # dim of subfeature vectors. So more samples used to calculate the Eigen vectors = larger L
-        print(f'k:{k}, N: {N}, S:{S}, L:{L}')
-        if exclude_test_point and mode == 'train':
-            neigh = NearestNeighbors(n_neighbors=k+1)
-        else:
-            neigh = NearestNeighbors(n_neighbors=k)
-        neigh.fit(self.reordered_feat_mat)
-        if mode == 'train':
-            for i, f in enumerate(self.reordered_feat_mat):
-                neighbors = neigh.kneighbors([f]) # returns ([distances], [indices]). Eg: (array([[9.14509525e-04, 1.09526892e+03, 1.12253833e+03]]), array([[0, 1, 7]]))
-                neighbor_indices = neighbors[1][0]
-                if exclude_test_point: # the first point should be the test point but this is to be extra sure
-                    neighbor_indices = np.delete(neighbor_indices, np.argwhere(neighbor_indices==i)) 
-                neighbor_features_mat = self.reordered_feat_mat[neighbor_indices]
-                self.eigen_memory[i] = self.calc_eigen_in_sets(neighbor_features_mat, S, L)
-            self.file_handler.dump_data(self.eigen_memory, pkl_dump_path, pkl_file_name)
+        S = N//self.set_size # divide into S sets
+        L = self.set_size # dim of subfeature vectors. So more samples used to calculate the Eigen vectors = larger L
 
-        elif mode == 'test':
-            assert len(self.eigen_memory.keys()) != 0, 'Load eigen memory first!'
+        # only extract features if they haven't been extracted and stored before
+        if not self.file_handler.pkl_exists(f'{parent_path}/test_good'):
+            test_good_features = self.extract_features(self.test_data_path_good)
+            self.file_handler.dump_data(test_good_features, parent_path, 'test_good')
+        else: # read extracted features from mem
+            test_good_features = self.file_handler.load_data(f'{parent_path}/test_good')
+        
+        # only extract features if they haven't been extracted and stored before
+        if not self.file_handler.pkl_exists(f'{parent_path}/test_ungood'):
+            test_ungood_features = self.extract_features(self.test_data_path_ungood)
+            self.file_handler.dump_data(test_ungood_features, parent_path, 'test_ungood')
+        else: # read extracted features from mem
+            test_ungood_features = self.file_handler.load_data(f'{parent_path}/test_ungood')
+        test_features, test_labels = self.make_ds(test_good_features, test_ungood_features)
+        feature_sets = self.get_features_sets(test_features, self.features_clusters)
+        test_features = np.concatenate(feature_sets, axis=1)
 
-            scores = list()
-            # for image in tqdm(self.images.images, desc='Processing images'):
-            for image in self.images.images[:25]:
-                f = self._extract_features(image.path)[1].view(-1).numpy()
-                neighbors = neigh.kneighbors([f])
-                neighbor_indices = neighbors[1][0]
-                neighbor_features_mat = self.reordered_feat_mat[neighbor_indices] 
-                req_eigen_mem = {i: self.eigen_memory[key] for i, key in enumerate(neighbor_indices)}
-                score = self.calc_anomaly_score(f, neighbor_features_mat, req_eigen_mem, S, L, k=k)
-                print(score)
-                scores.append(score)
-            avg_score = np.mean(scores)
-            print('AVG score:', avg_score)
-            print('Min score:', np.min(scores))
-            print('Max score:', np.max(scores))
+        neigh = NearestNeighbors(n_neighbors=self.n, metric="cosine")
+        neigh.fit(self.reordered_features)
+        scores = list()
 
-        else:
-            print(f'Invalid value for mode: {mode}')
-            raise ValueError
+        for f in tqdm(test_features, total=len(test_features), desc='Testing'):
+            neighbor_indices = neigh.kneighbors([f], return_distance=False)[0]
+            neighbor_features_mat = self.reordered_features[neighbor_indices] 
+            req_eigen_mem = {i: self.eigen_memory[key] for i, key in enumerate(neighbor_indices)}
+            score = self.calc_anomaly_score(f, neighbor_features_mat, req_eigen_mem, S, L, self.n)
+            scores.append(score)
+
+        roc_score = roc_auc_score(test_labels, scores)
+        fpr, tpr, thresholds = roc_curve(test_labels, scores, pos_label=0)
+        print(f'k:{self.n}, N: {N}, S:{S}, L:{L}, roc_auc_score: {roc_score}')
+        return roc_score
+
+
+    def save_subset_features(self, src_path, sub_size, dump_dir, dump_file_name):
+        features = self.file_handler.load_data(src_path)
+        self.file_handler.dump_data(features[:sub_size], dump_dir, dump_file_name)
