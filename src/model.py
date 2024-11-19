@@ -1,6 +1,7 @@
 '''
 Main k-nnn + CNN model
 '''
+from torchvision.transforms.functional import InterpolationMode
 import images as images_class
 import torch
 import numpy as np
@@ -18,7 +19,8 @@ from sklearn.metrics import roc_curve, roc_auc_score, average_precision_score
 from scipy.cluster.hierarchy import dendrogram, linkage
 from scipy.spatial.distance import squareform
 from scipy.cluster.hierarchy import fcluster
-
+import clip
+from torchvision.models import vit_h_14, ViT_H_14_Weights
 
 class Model:
     def __init__(self, KNNN_CONFIG:dict) -> None:
@@ -36,24 +38,68 @@ class Model:
         self.img_prep_type = KNNN_CONFIG['img_prep_type']
         self.file_handler = file_handler.FileHandler()
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        self.dino = torch.hub.load("facebookresearch/dinov2", self.embedding_model)
         if self.embedding_model == 'dinov2_vits14':
             self.feat_dim = 384 # 384 vits14 | 768 vitb14 | 1024 vitl14 | 1536 vitg14
+            self.model = torch.hub.load("facebookresearch/dinov2", self.embedding_model)
         elif self.embedding_model == 'dinov2_vitb14':
             self.feat_dim = 768
-        self.patch_size = self.dino.patch_size
-        self.patch_based_height = math.ceil(self.transform_height/self.patch_size)*self.patch_size # ensure dims work with selected model
-        self.patch_based_width = math.ceil(self.transform_width/self.patch_size)*self.patch_size
-        self.img_transform = {
-            "embedding": T.Compose([
-                T.Resize(size=(self.patch_based_height, self.patch_based_width)),
-                T.CenterCrop(size=(self.patch_based_height, self.patch_based_width)),
-                T.ToTensor(),
-                T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-                # T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-                ]
-            )
-        }
+            self.model = torch.hub.load("facebookresearch/dinov2", self.embedding_model)
+        elif self.embedding_model == 'ViT-B/32':
+            self.feat_dim = 512
+            self.model, self.preprocess = clip.load("ViT-B/32", device=self.device)
+            self.embedding_model = 'ViT-B_32'
+        elif self.embedding_model == 'vit_h_14':
+            self.feat_dim = 1280
+            self.weights = ViT_H_14_Weights.IMAGENET1K_SWAG_E2E_V1
+            self.model = vit_h_14(self.weights)
+
+        self.model.to(self.device)
+        if self.transform_height is None or self.transform_width is None:
+            self.img_transform = {
+                "embedding": T.Compose([
+                    T.ToTensor(),
+                    T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+                    # T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+                    ]
+                )
+            }
+        else:
+            if 'dinov2' in self.embedding_model:
+                self.patch_size = self.model.patch_size
+                self.patch_based_height = math.ceil(self.transform_height/self.patch_size)*self.patch_size # ensure dims work with selected model
+                self.patch_based_width = math.ceil(self.transform_width/self.patch_size)*self.patch_size
+                self.img_transform = {
+                    "embedding": T.Compose([
+                        T.Resize(size=(self.patch_based_height, self.patch_based_width),interpolation=InterpolationMode.BICUBIC),
+                        T.CenterCrop(size=(self.patch_based_height, self.patch_based_width)),
+                        T.ToTensor(),
+                        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+                        # T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+                        ]
+                    )
+                }
+            elif self.embedding_model == 'ViT-B_32':
+                self.img_transform = {
+                    "embedding": T.Compose([
+                        T.Resize(size=(224, 224),interpolation=InterpolationMode.BICUBIC),
+                        T.CenterCrop(size=(224, 224)),
+                        T.ToTensor(),
+                        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+                        # T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+                        ]
+                    )
+                }
+            elif self.embedding_model == 'vit_h_14':
+                self.img_transform = {
+                    "embedding": T.Compose([
+                        T.Resize(size=(518, 518),interpolation=InterpolationMode.BICUBIC),
+                        T.CenterCrop(size=(518, 518)),
+                        T.ToTensor(),
+                        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+                        # T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+                        ]
+                    )
+                }
         self.features_clusters = None
         self.reordered_features = None
         self.eigen_memory = None
@@ -62,8 +108,20 @@ class Model:
     def _extract_features(self, image:images_class.Image):
         image.data = Image.open(image.path).convert('RGB')
         img = self.img_transform['embedding'](image.data).unsqueeze(0)
-        with torch.no_grad():
-            features = self.dino(img)
+        if 'dinov2' in self.embedding_model:
+            with torch.no_grad():
+                features = self.model(img)
+        elif self.embedding_model == 'ViT-B_32':
+            # img = self.preprocess(image.data).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                features = self.model.encode_image(img)
+        elif self.embedding_model == 'vit_h_14':
+            with torch.no_grad():
+                feats = self.model._process_input(img)
+                batch_class_token = self.model.class_token.expand(img.shape[0], -1, -1)
+                feats = torch.cat([batch_class_token, feats], dim=1)
+                feats = self.model.encoder(feats)
+                features = feats[:, 0]
         features = features.view(-1).numpy() # flatten
         return features
         
@@ -79,7 +137,7 @@ class Model:
         assert select_images is None or (type(select_images) is int and select_images > 0 and select_images <= num_images), 'Invalid value for select_images'
         if select_images is not None:
             num_images = select_images
-        self.dino.eval()
+        self.model.eval()
         extracted_features = list()
         if concurrent:
             with cf.ThreadPoolExecutor() as executor:

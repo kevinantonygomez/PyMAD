@@ -15,17 +15,17 @@ def document_results(results_dict):
 
 
 def KNNN(): 
-    for nn in [100]:
-        for n in [3]:
-            for set_size in [8]:
+    for nn in [30]:
+        for n in [5]:
+            for set_size in [4]:
                 KNNN_CONFIG = {
-                    'embedding_model': 'dinov2_vits14',
-                    'dataset_name': 'mrnetknee', #chest, brain, mrnetknee
-                    'img_prep_type': 'Hist', #BW, OG, VD, Hist
-                    'transform_height': 256, # 512, 240, 256
-                    'transform_width': 256,
-                    'train_data_path': 'data/images.nosync/mrnetkneemris/MRNet-v1.0/train/axial_imgs_hist',
-                    'test_data_path': ('data/images.nosync/mrnetkneemris/MRNet-v1.0/valid/good/axial_imgs_hist', 'data/images.nosync/mrnetkneemris/MRNet-v1.0/valid/ungood/axial_imgs_hist'), # (good, ungood)
+                    'embedding_model': 'vit_h_14', # ViT-B/32 (always sets height and width to 224), vit_h_14 (always sets height and width to 518) dinov2_vits14
+                    'dataset_name': 'retina', #chest, brain, mrnetknee, retina, wrist, pathology
+                    'img_prep_type': 'OG', #BW, OG, VD, Hist, Clahe1
+                    'transform_height': 518, # 512, 240, 256, 256
+                    'transform_width': 518,
+                    'train_data_path': 'data/images.nosync/RESC/Train/train/good',
+                    'test_data_path': ('data/images.nosync/RESC/Test/test/good', 'data/images.nosync/RESC/Test/test/ungood'), # (good, ungood)
                     'output_root_path': 'data/output.nosync',
                     'set_size': set_size,
                     'nn': nn,
@@ -40,6 +40,8 @@ def KNNN():
                     'model': KNNN_CONFIG['embedding_model'],
                     'dataset_name': KNNN_CONFIG['dataset_name'],
                     'img_prep_type': KNNN_CONFIG['img_prep_type'],
+                    'transform_height': KNNN_CONFIG['transform_height'],
+                    'transform_width': KNNN_CONFIG['transform_width'],
                     '# Train': 'all',
                     '# Test': 'all',
                     'K_TRAIN': KNNN_CONFIG['nn'],
@@ -52,18 +54,18 @@ def KNNN():
 
 
 def vid_det():
-    A0 = 0.05
+    A0 = 0.5
     A1 = 5
-    chest_train_img_processor = img_processing.VisibilityDetection('data/images.nosync/BraTS2021_slice/mytest', img_height=240, img_width=240, hpr_param = (A0,A1), \
+    chest_train_img_processor = img_processing.VisibilityDetection('data/images.nosync/RESC/Test/my_test', img_height=512, img_width=512, hpr_param = (A0,A1), \
     tpo_param = (A0,A1), save='')
     chest_train_img_processor.run()
 
 def hist_eq():
-    x = img_processing.HistogramEqualization('data/images.nosync/mrnetkneemris/MRNet-v1.0/valid/ungood/axial_imgs', 256, 256, 'data/images.nosync/mrnetkneemris/MRNet-v1.0/valid/ungood/axial_imgs_hist')
+    x = img_processing.HistogramEqualization('data/images.nosync/RESC/Test/test/Ungood', 512, 512, 'data/images.nosync/RESC/Test/test/Ungood_hist')
     x.run_equalize()
 
 def clahe_eq():
-    x = img_processing.HistogramEqualization('data/images.nosync/mrnetkneemris/MRNet-v1.0/train/axial_imgs', 256, 256, 'data/images.nosync/mrnetkneemris/MRNet-v1.0/train/axial_imgs_clahe3', clip_limit=3)
+    x = img_processing.HistogramEqualization('data/images.nosync/RESC/Test/test/Ungood', 512, 512, 'data/images.nosync/RESC/Test/test/Ungood_clahe1_512', clip_limit=1)
     x.run_clahe_equalize()
 
 def bw():

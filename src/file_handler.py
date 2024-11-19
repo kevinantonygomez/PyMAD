@@ -37,13 +37,15 @@ class FileHandler:
                 print(f"Error while making save directory {dir_path}")
                 raise e
     
-    def check_folder(self, dir_path):
+    def pkl_exists(self, dir_path):
         if not self._type_check('dir_path', dir_path, str):
             raise TypeError
+        pkl_parent_path, pkl_name = os.path.split(dir_path)
+        if '.pbz2' not in pkl_name:
+            dir_path = f'{pkl_parent_path}/{pkl_name}.pbz2'
         if not os.path.exists(dir_path):
-            print(f'DIR DOES NOT EXIST: {dir_path}') 
-            raise FileNotFoundError
-        return dir_path
+            return False
+        return True
 
     def dump_data(self, data:object, dump_path:str, file_name:str, silent:bool=False) -> bool:
         '''
@@ -61,7 +63,7 @@ class FileHandler:
         if not os.path.exists(dump_path):
             self.create_folder(dump_path)
         try:
-            if not silent: print('Saving...')
+            # if not silent: print('Saving...')
             with bz2.BZ2File(f'{dump_path}/{file_name}.pbz2', 'w') as file:
                 pickle.dump(data, file)
             if not silent:
@@ -84,15 +86,15 @@ class FileHandler:
             head, tail = os.path.split(pkl_path)
             if '.pkl' not in tail:
                 pkl_path = f'{pkl_path}.pbz2'
-            if not silent: print('Loading...')
+            # if not silent: print('Loading...')
             data = bz2.BZ2File(pkl_path, 'rb')
             result = pickle.load(data)
             if not silent:
                 print(f'+++ Loaded: {pkl_path}')
-                if type(result) is dict:
-                    print(f'    Number of keys: {len(result.keys())}')
-                elif type(result) is list:
-                    print(f'    Number of objects: {len(result)}')
+                # if type(result) is dict:
+                #     print(f'    Number of keys: {len(result.keys())}')
+                # elif type(result) is list:
+                #     print(f'    Number of objects: {len(result)}')
             return result
         except Exception as e:
             print(f'!!! Failed to load: {pkl_path}\n', e)
