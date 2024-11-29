@@ -182,6 +182,10 @@ data/pickles
 data/images.nosync
 data/output.nosync
 data/pickles.nosync
+data
 src/img_size_change.py
+src/kneemri_prep.py
+src/unshadowVisibility
+src/visualization.py
+src/img_processing.py
 .vscode
-pickles_old

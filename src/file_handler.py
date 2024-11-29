@@ -1,3 +1,8 @@
+'''
+    This class handles file i/o
+    Author: Kevin Antony Gomez
+'''
+
 import os
 import pickle
 import bz2file as bz2
