@@ -34,4 +34,4 @@ dataset_mame/
 Main.py contains example code showing how to configure, train, and test the K-NNN model. 
 
 ## Results
-To be updated soon
+![](https://github.com/kevinantonygomez/PyMAD/blob/main/assets/poster.jpg)
